@@ -18,6 +18,7 @@ It only reads: no listening ports, no remote commands, no shell, Python standard
 import fcntl
 import getpass
 import glob
+import http.client
 import pwd
 import secrets
 import json
@@ -26,6 +27,7 @@ import re
 import shutil
 import socket
 import ssl
+import stat
 import threading
 import subprocess  # only fixed argument lists, never a shell  # nosec B404
 import sys
@@ -35,7 +37,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 CONF = "/etc/flatline.conf"
 STATE = "/var/lib/flatline/state.json"
 REMOTE_DEADLINE = 30  # seconds for all site and peer checks together
@@ -43,8 +45,15 @@ TOKEN_RE = re.compile(r"\d{5,16}:[A-Za-z0-9_-]{30,64}")
 CHAT_RE = re.compile(r"-?\d{1,20}")
 KEY_RE = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}")  # an ed25519 public key, nothing else
 NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,40}")
+UNIT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.-]*(@[A-Za-z0-9:_-][A-Za-z0-9:_.-]*)?")  # never an option or a bare "name@"
+ERROR_RE = re.compile(r"\b(error|exception|traceback|fatal|panic)\b", re.I)  # log lines are counted, never shown
+STATUS_RE = re.compile(r'\] "(?:[^"\\]|\\.)*" (\d{3}) ')  # the status after the request, in which Apache writes " as \"
+CACHE_FOR = 1800  # seconds watch mode reuses a certificate or search-engine result
+SEEN = {}  # what watch mode remembers between checks: restart counts, log positions, cached site results
+DETAILS = ("pm2", "docker", "sites", "services", "updates", "reboot")  # shown on the server's page in the Mac app
 SHARE_USER, SHARE_HOME = "flatline", "/var/lib/flatline-share"
-LIMITS = {"INTERVAL": (10, 3600), "DISK_MAX": (1, 100), "RAM_MAX": (1, 100)}
+LIMITS = {"INTERVAL": (10, 3600), "DISK_MAX": (1, 100), "RAM_MAX": (1, 100), "CERT_DAYS": (0, 365),
+          "LOG_ERRORS_MAX": (0, 1_000_000), "HTTP_ERRORS_MAX": (1, 1_000_000)}
 TEMPLATE = """\
 # Flatline agent config (root only). Apply changes with: sudo systemctl restart flatline
 NAME=
@@ -63,6 +72,20 @@ PEERS=
 HEARTBEAT_URL=
 # Failed systemd units to ignore (regex)
 IGNORE_UNITS=motd-news
+# Sites to also guard for search engines (noindex, robots.txt, sitemap, HSTS), comma separated
+SEO_SITES=
+# Warn this many days before a site's certificate expires (0 turns it off)
+CERT_DAYS=14
+# systemd services that must keep running, comma separated: nginx,postgresql
+UNITS=
+# Alert when a service in UNITS or a pm2 app logs more error lines than this in one check (0 turns it off)
+LOG_ERRORS_MAX=0
+# nginx or Apache access log to watch for 5xx and 429 answers: /var/log/nginx/access.log
+ACCESS_LOG=
+# Alert when one check finds more 5xx (or 429) lines than this
+HTTP_ERRORS_MAX=20
+# Alert on pending security updates and a needed reboot (yes or no)
+MAINTENANCE=yes
 """
 
 
@@ -95,7 +118,10 @@ def load_conf():
     conf["NAME"] = conf["NAME"] or socket.gethostname()
     for key, (low, high) in LIMITS.items():
         try:
-            conf[key] = min(max(float(conf[key]), low), high)
+            value = float(conf[key])
+            if value != value:  # nan slips past min and max
+                raise ValueError
+            conf[key] = min(max(value, low), high)
         except ValueError:
             log(f"bad {key} in {CONF}, using {defaults[key]}")
             conf[key] = float(defaults[key])
@@ -104,6 +130,17 @@ def load_conf():
     except re.error:
         log(f"bad IGNORE_UNITS in {CONF}, ignoring nothing")
         conf["IGNORE_RE"] = re.compile("(?!)")
+    conf["UNIT_LIST"] = []
+    for name in filter(None, (u.strip() for u in conf["UNITS"].split(","))):
+        typed = re.search(r"\.(service|socket|target|timer|path|mount|automount|swap|slice|scope|device)$", name)
+        unit = name if typed else name + ".service"
+        if not UNIT_RE.fullmatch(unit) or len(unit) > 255:  # what systemd would refuse fails every unit's query
+            log(f"bad unit name {name!r} in UNITS in {CONF}, skipping it")
+            continue
+        conf["UNIT_LIST"].append(unit)
+    if conf["MAINTENANCE"].lower() not in ("yes", "no"):
+        log(f"bad MAINTENANCE in {CONF}, using yes")
+    conf["MAINTENANCE"] = conf["MAINTENANCE"].lower() != "no"
     return conf
 
 
@@ -158,6 +195,32 @@ def run(*cmd, check=True):
     return done.stdout
 
 
+def note(v, problem, text):
+    """Attaches a short note, like "HTTP 404", shown next to the problem in its alert. Never a secret or log text."""
+    v.setdefault("notes", {})[problem] = text
+    return problem
+
+
+def new_lines(path):
+    """Yields the lines added to a log since the previous check: 50 MB at most, 1 MB at a time so memory stays small.
+    The first check only notes where the log ends. Only a regular file is read: a FIFO could hold the watch forever."""
+    with open(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as f:  # opening a FIFO doesn't wait for a writer
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        inode, offset, partial = SEEN.get(("log", path), (st.st_ino, st.st_size, b""))
+        if inode != st.st_ino or st.st_size < offset:
+            offset, partial = 0, b""  # rotated or truncated: read the new log from its start
+        f.seek(offset)
+        for block in iter(lambda: f.read(1_000_000), b""):
+            *complete, partial = (partial + block).split(b"\n")
+            partial = partial[:65536]  # a line with no end in sight is cut, not kept whole
+            yield from (line.decode("utf-8", "replace") for line in complete)
+            if f.tell() - offset >= 50_000_000:
+                break
+        SEEN[("log", path)] = (st.st_ino, f.tell(), partial)  # an unfinished last line waits for the next check
+
+
 def thresholds(conf, v):
     return [f"{what} above {conf[key]:g}%" for what, key in (("disk", "DISK_MAX"), ("ram", "RAM_MAX"))
             if v[what] >= conf[key]]
@@ -167,6 +230,45 @@ def units(conf, v):
     out = run("systemctl", "list-units", "--state=failed", "--no-legend", "--plain")
     names = (line.split()[0] for line in out.splitlines() if line.strip())
     return [f"{name} failed" for name in names if not conf["IGNORE_RE"].search(name)]
+
+
+def services(conf, v):
+    names = conf["UNIT_LIST"]
+    if not names:
+        return []
+    out = run("systemctl", "show", "--property=LoadState,ActiveState,SubState,NRestarts", "--", *names)
+    blocks = out.strip().split("\n\n")
+    if len(blocks) != len(names):
+        raise ValueError("systemctl show answered for a different number of units")
+    found, details = [], []
+    for name, block in zip(names, blocks):
+        p = parse(block)
+        state = "not found" if p.get("LoadState") == "not-found" else f"{p.get('ActiveState')} ({p.get('SubState')})"
+        restarts, before = int(p.get("NRestarts") or 0), SEEN.get(("restarts", name))
+        SEEN[("restarts", name)] = restarts
+        details.append({"name": name, "state": state, "restarts": restarts})
+        active = p.get("ActiveState")
+        # a failed unit is already reported by the units check, unless IGNORE_UNITS hides it there
+        if state == "not found" or active not in ("active", "reloading") and (
+                active != "failed" or conf["IGNORE_RE"].search(name)):
+            found.append(note(v, f"service {name} not running", state))
+        if before is not None and restarts > before:  # the first check only notes the count
+            found.append(note(v, f"service {name} restarting", f"{restarts - before} restarts"))
+    v["services"] = details[:50]  # shown on the server's page in the Mac app
+    return found
+
+
+def journal(conf, v):
+    found = []
+    for name in conf["UNIT_LIST"] if conf["LOG_ERRORS_MAX"] else []:
+        out = run("journalctl", f"--unit={name}", f"--since=-{int(conf['INTERVAL'])}s", "--output=json",
+                  "--output-fields=PRIORITY,MESSAGE", "--lines=20000", "--no-pager", "--quiet")
+        entries = (json.loads(line) for line in out.splitlines() if line.strip())  # one at a time, never all at once
+        count = sum(1 for e in entries if e.get("PRIORITY") in ("0", "1", "2", "3")  # err, crit, alert, emerg
+                    or isinstance(e.get("MESSAGE"), str) and ERROR_RE.search(e["MESSAGE"]))
+        if count > conf["LOG_ERRORS_MAX"]:
+            found.append(note(v, f"service {name} logging errors", f"{count} lines"))
+    return found
 
 
 def pm2(conf, v):
@@ -188,7 +290,20 @@ def pm2(conf, v):
              "mem": p.get("monit", {}).get("memory", 0) // 1048576, "restarts": p["pm2_env"].get("restart_time", 0)}
             for p in data]
     v["pm2"] = apps[:50]  # shown on the server's page in the Mac app
-    return [f"pm2 {a['name']} down" for a in apps if a["status"] != "online"]  # one name, whatever the status
+    found = [f"pm2 {a['name']} down" for a in apps if a["status"] != "online"]  # one name, whatever the status
+    if conf["LOG_ERRORS_MAX"]:
+        errors = {}
+        for p in data:  # instances of one app share its name, and often its log
+            path = p["pm2_env"].get("pm_err_log_path")
+            if not isinstance(path, str) or path == os.devnull:  # error_file /dev/null turns the log off
+                continue
+            try:  # a log Flatline can't read fails the check loudly
+                errors[p["name"]] = errors.get(p["name"], 0) + sum(1 for line in new_lines(path) if ERROR_RE.search(line))
+            except FileNotFoundError:
+                pass  # nothing logged yet
+        found += [note(v, f"pm2 {name} logging errors", f"{n} lines") for name, n in errors.items()
+                  if n > conf["LOG_ERRORS_MAX"]]
+    return found
 
 
 def docker(conf, v):
@@ -209,21 +324,170 @@ def site_label(spec):
     return (parts.hostname or "?") + parts.path
 
 
-def site(spec):
-    url = spec if "://" in spec else "https://" + spec
-    label = site_label(spec)
-    if urllib.parse.urlsplit(url).scheme not in ("https", "http"):
-        return f"site {label} invalid url"
+class Redirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Follows redirects to http(s) only; urllib on its own would also follow one to ftp."""
+        if urllib.parse.urlsplit(newurl).scheme in ("http", "https"):
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+        return None
+
+
+OPENER = urllib.request.build_opener(Redirects)
+
+
+def fetch(url, limit=0, timeout=10):
+    """GETs an http(s) URL: (status, final url, headers, up to `limit` bytes of body). An HTTP error is an answer too."""
+    request = urllib.request.Request(url, headers={"User-Agent": "flatline"})
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "flatline"})
-        with urllib.request.urlopen(request, timeout=10):  # http(s) checked above  # nosec B310
-            return None
-    except urllib.error.HTTPError as e:  # 4xx counts as up: login walls answer 401/403
-        return f"site {label} down" if e.code >= 500 else None
+        with OPENER.open(request, timeout=timeout) as r:  # callers only pass http(s)  # nosec B310
+            return r.status, r.url, r.headers, r.read(limit) if limit else b""
+    except urllib.error.HTTPError as e:
+        return e.code, e.filename, e.headers, b""
+
+
+def answer(url, limit=0):
+    """A site's page: ("HTTP 200", (final url, headers, body)), or ("timeout" | "no answer" | "certificate error", None)."""
+    try:
+        status, final, headers, body = fetch(url, limit)
+        return f"HTTP {status}", (final, headers, body)
     except urllib.error.URLError as e:
-        return f"site {label} " + ("certificate error" if isinstance(e.reason, ssl.SSLError) else "down")
-    except Exception:  # timeouts, broken HTTP, anything else
-        return f"site {label} down"
+        if isinstance(e.reason, ssl.SSLError):
+            return "certificate error", None
+        return ("timeout" if isinstance(e.reason, socket.timeout) else "no answer"), None
+    except socket.timeout:
+        return "timeout", None
+    except Exception:  # broken HTTP, anything else
+        return "no answer", None
+
+
+def up(status):
+    """Any answer below 400 is up, and so are login walls (401, 403)."""
+    return status.startswith("HTTP ") and (int(status[5:]) < 400 or status in ("HTTP 401", "HTTP 403"))
+
+
+def cached(key):
+    """A result from an earlier check in the last half hour; only watch mode lives long enough to have one."""
+    hit = SEEN.get(key)
+    return hit[1] if hit and time.time() - hit[0] < CACHE_FOR else None
+
+
+def cert_days(host, port):
+    """Whole days left on a site's certificate, or None when it can't be read."""
+    days = cached(("cert", host, port))
+    if days is None:
+        try:
+            with socket.create_connection((host, port), timeout=5) as raw:
+                with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as tls:
+                    days = int((ssl.cert_time_to_seconds(tls.getpeercert()["notAfter"]) - time.time()) // 86400)
+            SEEN[("cert", host, port)] = (time.time(), days)
+        except (OSError, ValueError, KeyError):  # not a problem by itself: the page request reports real TLS trouble
+            pass
+    return days
+
+
+def keeps_out(rules):
+    """Whether a robots rule list like "noindex, nofollow" or "googlebot: none" says noindex or none."""
+    for rule in rules.lower().split(","):
+        name, colon, rest = rule.partition(":")
+        if colon and not name.strip().startswith(("max-", "unavailable_after")):
+            rule = rest  # "googlebot: noindex" names a crawler first; "max-image-preview:none" is its own rule
+        if rule.strip() in ("noindex", "none"):
+            return True
+    return False
+
+
+def noindex(headers, html):
+    """An X-Robots-Tag header or a robots/googlebot meta tag that keeps search engines out."""
+    if any(keeps_out(h) for h in headers.get_all("X-Robots-Tag") or []):
+        return True
+    for tag in re.findall(r"<meta\b[^<>]*>", html, re.I):  # [^<>] keeps a page full of "<meta" from taking minutes
+        pairs = re.findall(r"(?<![\w-])(name|content)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'>]+))", tag, re.I)
+        attrs = {k.lower(): "".join(values) for k, *values in pairs}  # quoted, single-quoted or bare
+        if attrs.get("name", "").strip().lower() in ("robots", "googlebot") and keeps_out(attrs.get("content", "")):
+            return True
+    return False
+
+
+def robots(text, origin):
+    """Reads robots.txt: (whether a group for every crawler says "Disallow: /", the sitemap URL to check)."""
+    agents, rules, blocked, sitemap = [], False, False, None
+    for line in text.splitlines():
+        field, colon, value = line.split("#", 1)[0].partition(":")
+        field, value = field.strip().lower(), value.strip()
+        if field == "user-agent":
+            agents = ([] if rules else agents) + [value]  # a user-agent line after rules starts a new group
+            rules = False
+        elif field == "sitemap":
+            sitemap = value if sitemap is None else sitemap
+        elif colon:
+            rules = True
+            blocked = blocked or (field == "disallow" and value == "/" and "*" in agents)
+    try:
+        scheme = urllib.parse.urlsplit(sitemap or "").scheme
+    except ValueError:  # a broken Sitemap line, like "https://[example.com/s.xml"
+        scheme = ""
+    return blocked, sitemap if scheme in ("http", "https") else origin + "/sitemap.xml"
+
+
+EXTRAS = ("robots.txt blocks crawlers", "sitemap missing")  # what the extra requests find, not the page
+
+
+def search_guard(url, final, headers, body, deadline):
+    """noindex, robots.txt, sitemap and HSTS for a site's page: ({problem: note}, whether every extra request answered)."""
+    label, found = site_label(url), {}
+    if noindex(headers, body.decode("utf-8", "replace")):
+        found[f"site {label} noindex"] = ""
+    if final.startswith("https://") and "Strict-Transport-Security" not in headers:
+        found[f"site {label} no HSTS"] = ""
+    parts = urllib.parse.urlsplit(final)
+    origin = f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}"
+    if time.monotonic() > deadline - 10:  # no time left for the extra requests: unknown this time
+        return found, False
+    try:
+        status, _, _, text = fetch(origin + "/robots.txt", 512 * 1024, timeout=5)
+        blocked, sitemap = robots(text.decode("utf-8-sig", "replace") if status == 200 else "", origin)
+        if blocked:
+            found[f"site {label} robots.txt blocks crawlers"] = ""
+        status = fetch(sitemap, timeout=5)[0]
+        if status != 200:
+            found[f"site {label} sitemap missing"] = f"HTTP {status}"
+    except (OSError, ValueError, http.client.HTTPException):  # an extra request that fails is unknown, not a problem
+        return found, False
+    return found, True
+
+
+def site(url, conf, seo=False, deadline=float("inf"), early=None):
+    """Checks one site: (its detail for the Mac app, {problem: note}). The page's own verdict goes into `early`
+    before the search-engine extras, so extras that run past the deadline can't make a working site look down."""
+    label, parts = site_label(url), urllib.parse.urlsplit(url)
+    if parts.scheme not in ("https", "http"):
+        return {"site": label, "ok": False, "status": "invalid url", "cert_days": None}, {f"site {label} invalid url": ""}
+    guard = cached(("seo", url)) if seo else {}
+    limit = 512 * 1024 if guard is None else 0  # the page itself is only read when the search-engine look is due
+    status, reply = answer(url, limit)
+    if not up(status):
+        time.sleep(3)  # ask again before calling it down, so blips stay quiet
+        status, reply = answer(url, limit)
+    found, days = {}, None
+    if status == "certificate error":
+        found[f"site {label} certificate error"] = ""
+    elif not up(status):
+        found[f"site {label} down"] = status
+    if status.startswith("HTTP ") and parts.scheme == "https" and conf["CERT_DAYS"] and time.monotonic() < deadline - 5:
+        days = cert_days(parts.hostname, parts.port or 443)
+        if days is not None and days < conf["CERT_DAYS"]:
+            found[f"site {label} certificate expires soon"] = f"in {days} days"
+    detail = {"site": label, "ok": up(status), "status": status, "cert_days": days}
+    seen_at, last = SEEN.get(("seo", url), (0, {}))  # the last search-engine look, however old
+    if early is not None:
+        early[url] = (detail, {**found, **last})
+    if guard is None and up(status):
+        fresh, complete = search_guard(url, *reply, deadline)
+        # a request that went unanswered keeps its last answer; noindex and HSTS were just read off the page
+        guard = fresh if complete else {**{k: n for k, n in last.items() if k.endswith(EXTRAS)}, **fresh}
+        SEEN[("seo", url)] = (time.time() if complete else seen_at, guard)  # unanswered: looks again next check
+    found.update(last if guard is None else guard)  # a page that's down keeps the last look
+    return detail, found
 
 
 def peer(spec):
@@ -241,7 +505,7 @@ def peer(spec):
 
 
 def probe(check, spec):
-    """Runs a site or peer check twice before calling it a problem, so blips stay quiet."""
+    """Runs a peer check twice before calling it a problem, so blips stay quiet."""
     problem = check(spec)
     if problem:
         time.sleep(3)
@@ -250,23 +514,69 @@ def probe(check, spec):
 
 
 def remote(conf, v):
-    checks = [(site, s.strip()) for s in conf["SITES"].split(",") if s.strip()]
-    checks += [(peer, p.strip()) for p in conf["PEERS"].split(",") if p.strip()]
-    if not checks:
+    sites = {}
+    for key, seo in (("SITES", False), ("SEO_SITES", True)):
+        for spec in filter(None, (s.strip() for s in conf[key].split(","))):
+            url = spec if "://" in spec else "https://" + spec
+            sites[url] = sites.get(url, False) or seo  # listed in both: checked once, with the extras
+    peers = [p.strip() for p in conf["PEERS"].split(",") if p.strip()]
+    if not sites and not peers:
         return []
-    pool = ThreadPoolExecutor(8)
-    futures = {pool.submit(probe, *c): c for c in checks}
-    done, late = wait(futures, timeout=REMOTE_DEADLINE)
+    deadline = time.monotonic() + REMOTE_DEADLINE  # the extras are skipped when it gets close
+    pool, early = ThreadPoolExecutor(8), {}
+    site_jobs = {url: pool.submit(site, url, conf, seo, deadline, early) for url, seo in sites.items()}
+    peer_jobs = {spec: pool.submit(probe, peer, spec) for spec in peers}
+    wait([*site_jobs.values(), *peer_jobs.values()], timeout=REMOTE_DEADLINE)
     pool.shutdown(wait=False)  # ponytail: a host that trickles bytes keeps its thread until it gives up
-    found = [f.result() for f in done if f.result()]
-    found += [f"site {site_label(spec)} down" if check is site else f"peer {spec.rpartition('=')[0] or spec} unreachable"
-              for check, spec in (futures[f] for f in late)]
+    found = [job.result() if job.done() else f"peer {spec.rpartition('=')[0] or spec} unreachable"
+             for spec, job in peer_jobs.items()]
+    found, details = [p for p in found if p], []
+    for url, job in site_jobs.items():
+        label = site_label(url)
+        detail, probs = job.result() if job.done() else early.get(url, (  # late extras keep the page's verdict
+            {"site": label, "ok": False, "status": "timeout", "cert_days": None}, {f"site {label} down": "timeout"}))
+        details.append(detail)
+        found += [note(v, problem, text) for problem, text in probs.items()]
+    if details:
+        v["sites"] = details[:50]  # shown on the server's page in the Mac app
+    return found
+
+
+def access_log(conf, v):
+    path = conf["ACCESS_LOG"]
+    if not path:
+        return []
+    if not path.startswith("/"):
+        raise ValueError("ACCESS_LOG must be an absolute path")
+    codes = [m.group(1) for m in map(STATUS_RE.search, new_lines(path)) if m]
+    found = []
+    for what, count in (("5xx", sum(c.startswith("5") for c in codes)), ("429", codes.count("429"))):
+        if count > conf["HTTP_ERRORS_MAX"]:
+            found.append(note(v, f"access log {what} above {conf['HTTP_ERRORS_MAX']:g}", f"{count} in the last check"))
+    return found
+
+
+def maintenance(conf, v):
+    if not conf["MAINTENANCE"]:
+        return []
+    found = []
+    text = read("/var/lib/update-notifier/updates-available", 100_000)  # Ubuntu's apt keeps it fresh
+    if text:  # anywhere else the count is unknown
+        # standard, ESM Infra and ESM Apps updates each get their own line; "can be applied with ESM" ones can't yet
+        counts = re.findall(r"(\d+) (?:of these )?updates? (?:is|are) (?:an? )?(?:standard |ESM \w+ )?security", text)
+        v["updates"] = sum(map(int, counts))
+        if v["updates"]:
+            found.append(note(v, "security updates pending", f"{v['updates']} updates"))
+    v["reboot"] = os.path.exists("/run/reboot-required")
+    if v["reboot"]:
+        packages = dict.fromkeys(read("/run/reboot-required.pkgs", 100_000).split())
+        found.append(note(v, "reboot required", ", ".join(list(packages)[:3])))
     return found
 
 
 def problems(conf, v):
     found = []
-    for check in (thresholds, units, pm2, docker, remote):
+    for check in (thresholds, units, services, journal, pm2, docker, remote, access_log, maintenance):
         try:
             found += check(conf, v)
         except Exception as e:  # a broken check must be loud, never silently blind
@@ -299,7 +609,7 @@ def send(token, chat, text):
 def heartbeat(url):
     def ping():
         try:
-            urllib.request.urlopen(url, timeout=10).close()  # http(s) checked above  # nosec B310
+            OPENER.open(url, timeout=10).close()  # http(s) checked below, redirects too  # nosec B310
         except Exception:
             pass
     if url.startswith(("https://", "http://")):
@@ -310,8 +620,9 @@ def uptime(s):
     return f"{s // 86400}d {s % 86400 // 3600}h" if s >= 86400 else f"{s // 3600}h {s % 3600 // 60}m"
 
 
-def bullets(items):
-    return "\n".join(f"• {p}" for p in sorted(items))
+def bullets(items, notes=None):
+    notes = notes or {}
+    return "\n".join(f"• {p}" + (f" · {notes[p]}" if notes.get(p) else "") for p in sorted(items))
 
 
 def summary(name, v, probs):
@@ -321,23 +632,23 @@ def summary(name, v, probs):
 
 
 def tick(conf, state):
-    """One check. Alerts on problems seen twice in a row and announces recoveries."""
+    """One check. Alerts on a problem seen on two checks in a row, and on its recovery after two clean checks."""
     v = vitals()
-    now = set(problems(conf, v))
+    now, before = set(problems(conf, v)), set(state.get("problems", []))
     alerted = set(state.get("alerted", []))
-    new = (now & set(state.get("problems", []))) - alerted
-    fixed = alerted - now
+    new = (now & before) - alerted
+    fixed = alerted - now - before  # gone from this check and the one before, so a flapping problem can't spam
     token, chat, name = conf["TELEGRAM_TOKEN"], conf["TELEGRAM_CHAT_ID"], conf["NAME"]
     if token and chat:
         # a failed send leaves the set as it was, so the next check tries again
-        if new and send(token, chat, f"🔴 {name}\n{bullets(new)}"):
+        if new and send(token, chat, f"🔴 {name}\n{bullets(new, v.get('notes'))}"):
             alerted |= new
         if fixed and send(token, chat, f"✅ {name} recovered\n{bullets(fixed)}"):
             alerted -= fixed
     heartbeat(conf["HEARTBEAT_URL"])
     return {"time": int(time.time()), "name": name, "interval": conf["INTERVAL"], "version": VERSION,
             "problems": sorted(now), "alerted": sorted(alerted),
-            "details": {k: v[k] for k in ("pm2", "docker") if k in v}}
+            "details": {k: v[k] for k in DETAILS if k in v}}
 
 
 def read_state():
@@ -374,7 +685,8 @@ def status(as_json, live=False):
         conf, state = load_conf(), {}
         v = vitals()
         probs, name = problems(conf, v), conf["NAME"]
-        details = {k: v.pop(k) for k in ("pm2", "docker") if k in v}
+        details = {k: v.pop(k) for k in DETAILS if k in v}
+        v.pop("notes", None)  # notes only go into alerts
     else:
         state = read_state()
         probs = list(state.get("problems", []))
@@ -383,7 +695,7 @@ def status(as_json, live=False):
         name, v, details = state.get("name") or socket.gethostname(), vitals(), state.get("details", {})
     if as_json:
         system = {"os": parse(read("/etc/os-release")).get("PRETTY_NAME", "Linux"), "kernel": os.uname().release}
-        print(json.dumps(dict(v, name=name, problems=probs, agent=not live, **system, **details)))
+        print(json.dumps(dict(v, name=name, problems=probs, agent=not live, version=VERSION, **system, **details)))
     else:
         print(summary(name, v, probs))
 

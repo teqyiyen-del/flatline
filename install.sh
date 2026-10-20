@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Flatline agent installer. On each server:
 #   curl -fsSL https://github.com/teqyiyen-del/flatline/releases/latest/download/install.sh | sudo bash
-# Run it again to update; your config is kept. Pin a release with FLATLINE_VERSION=v0.2.0
+# Run it again to update; your config is kept. Pin a release with FLATLINE_VERSION=v0.3.0
 set -euo pipefail
 
 main() {  # everything runs from here, so a half-downloaded script can't run half the steps
@@ -64,7 +64,9 @@ fetch() {  # HTTPS only, redirects included
 }
 
 write_unit() {  # read-only sandbox: the agent can't change the system even if something goes wrong
-  cat > /etc/systemd/system/flatline.service <<'EOF'
+  local adm=""  # Debian and Ubuntu keep web server logs as www-data:adm 0640; a missing group would stop the service
+  getent group adm >/dev/null && adm="SupplementaryGroups=adm"
+  cat > /etc/systemd/system/flatline.service <<EOF
 [Unit]
 Description=Flatline server monitor
 After=network-online.target
@@ -99,6 +101,7 @@ RestrictRealtime=yes
 RestrictNamespaces=yes
 LockPersonality=yes
 SystemCallArchitectures=native
+$adm
 
 [Install]
 WantedBy=multi-user.target

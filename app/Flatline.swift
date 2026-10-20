@@ -37,6 +37,10 @@ struct Vitals: Decodable {
     var os, kernel: String?
     var pm2: [Pm2App]?
     var docker: [Container]?
+    var sites: [Site]?
+    var services: [Service]?
+    var updates: Int?  // security updates pending
+    var reboot: Bool?
     var agent: Bool?  // false: read once over SSH with nothing installed
 
     struct Pm2App: Decodable {
@@ -47,6 +51,17 @@ struct Vitals: Decodable {
 
     struct Container: Decodable {
         let name, state, status: String
+    }
+
+    struct Site: Decodable {
+        let site, status: String
+        let ok: Bool
+        let certDays: Int?
+    }
+
+    struct Service: Decodable {
+        let name, state: String
+        let restarts: Int
     }
 }
 
@@ -826,9 +841,28 @@ struct DetailCard: View {
                     if let load = v.load { Info("Load", load.map { String(format: "%.2f", $0) }.joined(separator: "  ")) }
                     if let os = v.os { Info("OS", os) }
                     if let kernel = v.kernel { Info("Kernel", kernel) }
+                    if let updates = v.updates { Info("Security updates", "\(updates)", tint: updates > 0 ? .warn : .ink) }
+                    if let reboot = v.reboot { Info("Reboot", reboot ? "required" : "not needed", tint: reboot ? .warn : .ink) }
                     Info("SSH", server.id)
                     Info("Mode", server.guest ? "shared with you · read only" : v.agent == false
                          ? "nothing installed · alerts only while this Mac is on" : "agent · alerts around the clock")
+                }
+                if let sites = v.sites, !sites.isEmpty {
+                    VStack(alignment: .leading, spacing: 0) {
+                        SectionTitle("Sites · \(sites.count)").padding(.bottom, 4)
+                        ForEach(Array(sites.enumerated()), id: \.offset) { _, site in
+                            Item(ok: site.ok, name: site.site, detail: site.status, tail: cert(site.certDays))
+                        }
+                    }
+                }
+                if let services = v.services, !services.isEmpty {
+                    VStack(alignment: .leading, spacing: 0) {
+                        SectionTitle("Services · \(services.count)").padding(.bottom, 4)
+                        ForEach(Array(services.enumerated()), id: \.offset) { _, service in
+                            Item(ok: service.state.hasPrefix("active"), name: service.name,
+                                 detail: service.restarts > 0 ? "\(service.state)  ↺ \(service.restarts)" : service.state)
+                        }
+                    }
                 }
                 if let apps = v.pm2, !apps.isEmpty {
                     VStack(alignment: .leading, spacing: 0) {
@@ -863,6 +897,13 @@ struct DetailCard: View {
     func size(_ used: Double?, _ total: Double?) -> String {
         guard let used, let total else { return "" }
         return String(format: "%.1f / %.1f GB", used, total)
+    }
+
+    /// Days left on a site's certificate: amber under two weeks, red under one.
+    func cert(_ days: Int?) -> Text {
+        guard let days else { return Text("") }
+        let text = Text(verbatim: " · cert \(days) d")
+        return days < 7 ? text.foregroundStyle(Color.bad) : days < 14 ? text.foregroundStyle(Color.warn) : text
     }
 }
 
@@ -970,17 +1011,19 @@ struct DotChart: View {
 struct Info: View {
     let key: String
     let value: String
+    let tint: Color
 
-    init(_ key: String, _ value: String) {
+    init(_ key: String, _ value: String, tint: Color = .ink) {
         self.key = key
         self.value = value
+        self.tint = tint
     }
 
     var body: some View {
         HStack {
             Text(key).foregroundStyle(Color.muted)
             Spacer(minLength: 12)
-            Text(value).foregroundStyle(Color.ink).lineLimit(1).truncationMode(.middle)
+            Text(value).foregroundStyle(tint).lineLimit(1).truncationMode(.middle)
         }
         .padding(.vertical, 6)
         .overlay(alignment: .bottom) { Rectangle().fill(Color.hairline).frame(height: 1) }
@@ -991,13 +1034,14 @@ struct Item: View {
     let ok: Bool
     let name: String
     let detail: String
+    var tail = Text("")  // a last bit of detail that may carry its own colour
 
     var body: some View {
         HStack(spacing: 8) {
             Circle().fill(ok ? Color.ok : Color.bad).frame(width: 6, height: 6)
             Text(name).foregroundStyle(Color.ink).lineLimit(1)
             Spacer(minLength: 12)
-            Text(detail).foregroundStyle(ok ? Color.muted : Color.bad).lineLimit(1)
+            Text("\(Text(verbatim: detail))\(tail)").foregroundStyle(ok ? Color.muted : Color.bad).lineLimit(1).truncationMode(.middle)
         }
         .padding(.vertical, 6)
         .overlay(alignment: .bottom) { Rectangle().fill(Color.hairline).frame(height: 1) }
