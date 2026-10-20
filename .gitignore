@@ -1,7 +1,5 @@
 app/build/
 dist/
-site/node_modules/
-site/dist/
 __pycache__/
 .DS_Store
 .vercel/
