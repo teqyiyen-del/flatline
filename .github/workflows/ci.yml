@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Still parses on Python 3.8
+        run: python3 -c "import ast; ast.parse(open('agent/flatline').read(), feature_version=(3, 8))"
+      - name: Tests
+        run: python3 agent/test_flatline.py
+      - name: Security scan (medium and above)
+        run: pipx run bandit -q -ll agent/flatline
+      - name: Shell scripts
+        run: shellcheck install.sh app/build.sh app/make-dmg.sh
+  app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Build
+        run: ARCHS=arm64 ./app/build.sh

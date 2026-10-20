@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""Flatline agent: know before your server flatlines.
+
+usage:
+  flatline status [--json]   vitals and current problems (the Mac app runs this over SSH)
+  flatline watch             check forever and alert on Telegram (run by systemd)
+  flatline setup             connect a Telegram bot interactively
+  flatline telegram          read a bot token and chat id from stdin (used by the Mac app)
+  flatline share             make a one-time, 24-hour invite for read-only access (used by the Mac app)
+  flatline access [--json]   list who has read-only access; flatline revoke NAME takes it away
+  flatline uninstall         remove Flatline and everything it created
+  flatline --version
+
+Without installing anything, `python3 - status --json --live < flatline` reads a server once and leaves no trace.
+
+It only reads: no listening ports, no remote commands, no shell, Python standard library only.
+"""
+import fcntl
+import getpass
+import glob
+import pwd
+import secrets
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import threading
+import subprocess  # only fixed argument lists, never a shell  # nosec B404
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, wait
+
+VERSION = "0.2.0"
+CONF = "/etc/flatline.conf"
+STATE = "/var/lib/flatline/state.json"
+REMOTE_DEADLINE = 30  # seconds for all site and peer checks together
+TOKEN_RE = re.compile(r"\d{5,16}:[A-Za-z0-9_-]{30,64}")
+CHAT_RE = re.compile(r"-?\d{1,20}")
+KEY_RE = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}")  # an ed25519 public key, nothing else
+NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,40}")
+SHARE_USER, SHARE_HOME = "flatline", "/var/lib/flatline-share"
+LIMITS = {"INTERVAL": (10, 3600), "DISK_MAX": (1, 100), "RAM_MAX": (1, 100)}
+TEMPLATE = """\
+# Flatline agent config (root only). Apply changes with: sudo systemctl restart flatline
+NAME=
+TELEGRAM_TOKEN=
+TELEGRAM_CHAT_ID=
+# Alert when usage reaches these percentages
+DISK_MAX=90
+RAM_MAX=90
+# Seconds between checks (10-3600)
+INTERVAL=60
+# Websites to check, comma separated: example.com,https://api.example.com/health
+SITES=
+# Other servers to watch, comma separated name=host:port. Alerts when they stop answering
+PEERS=
+# Dead man's switch, pinged every check (healthchecks.io, Uptime Kuma push, ...)
+HEARTBEAT_URL=
+# Failed systemd units to ignore (regex)
+IGNORE_UNITS=motd-news
+"""
+
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)  # lands in journalctl -u flatline
+
+
+def die(code, message):
+    log(message)
+    sys.exit(code)
+
+
+def read(path, limit=1_000_000):
+    try:
+        with open(path) as f:
+            return f.read(limit)
+    except OSError:
+        return ""
+
+
+def parse(text):
+    pairs = (line.partition("=") for line in text.splitlines())
+    return {k.strip(): v.strip().strip("\"'") for k, eq, v in pairs if eq and not k.lstrip().startswith("#")}
+
+
+def load_conf():
+    defaults = parse(TEMPLATE)
+    conf = dict(defaults)
+    conf.update({k: v for k, v in parse(read(CONF)).items() if k in defaults and v})  # unknown keys are ignored
+    conf["NAME"] = conf["NAME"] or socket.gethostname()
+    for key, (low, high) in LIMITS.items():
+        try:
+            conf[key] = min(max(float(conf[key]), low), high)
+        except ValueError:
+            log(f"bad {key} in {CONF}, using {defaults[key]}")
+            conf[key] = float(defaults[key])
+    try:
+        conf["IGNORE_RE"] = re.compile(conf["IGNORE_UNITS"] or "(?!)")
+    except re.error:
+        log(f"bad IGNORE_UNITS in {CONF}, ignoring nothing")
+        conf["IGNORE_RE"] = re.compile("(?!)")
+    return conf
+
+
+def save_conf(values):
+    if any(ch in str(v) for v in values.values() for ch in "\r\n\0"):
+        raise ValueError("config values can't contain line breaks")
+    lines = (read(CONF) or TEMPLATE).splitlines()
+    for key, value in values.items():
+        at = [i for i, line in enumerate(lines) if line.partition("=")[0].strip() == key]
+        if at:
+            lines[at[0]] = f"{key}={value}"
+        else:
+            lines.append(f"{key}={value}")
+    fd = os.open(CONF + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)  # holds the bot token
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(CONF + ".tmp", CONF)
+
+
+def vitals():
+    def cpu_ticks():
+        t = [int(x) for x in read("/proc/stat").splitlines()[0].split()[1:]]
+        return t[3] + t[4], sum(t)  # idle + iowait, total
+
+    idle1, total1 = cpu_ticks()
+    time.sleep(0.3)
+    idle2, total2 = cpu_ticks()
+    mem = {k: int(v.split()[0]) for k, v in (line.split(":", 1) for line in read("/proc/meminfo").splitlines())}
+    total, available = mem["MemTotal"], mem["MemAvailable"]  # kB
+    disk = shutil.disk_usage("/")
+    return {
+        "cpu": round(100 * (1 - (idle2 - idle1) / max(total2 - total1, 1)), 1),
+        "ram": round(100 * (1 - available / total), 1),
+        "disk": round(100 * disk.used / (disk.used + disk.free), 1),
+        "load": [round(x, 2) for x in os.getloadavg()],
+        "cores": os.cpu_count(),
+        "uptime": int(float(read("/proc/uptime").split()[0])),
+        "mem_used": (total - available) // 1024, "mem_total": total // 1024,  # MB
+        "disk_used": round(disk.used / 1e9, 1), "disk_total": round((disk.used + disk.free) / 1e9, 1),  # GB
+    }
+
+
+def run(*cmd, check=True):
+    """Runs a fixed command. "" when the program isn't installed; raises when it fails, so checks stay loud."""
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=20)  # fixed argv  # nosec B603
+    except FileNotFoundError:
+        return ""
+    if check and done.returncode != 0:
+        raise RuntimeError(f"{cmd[0]} exited with {done.returncode}")
+    return done.stdout
+
+
+def thresholds(conf, v):
+    return [f"{what} above {conf[key]:g}%" for what, key in (("disk", "DISK_MAX"), ("ram", "RAM_MAX"))
+            if v[what] >= conf[key]]
+
+
+def units(conf, v):
+    out = run("systemctl", "list-units", "--state=failed", "--no-legend", "--plain")
+    names = (line.split()[0] for line in out.splitlines() if line.strip())
+    return [f"{name} failed" for name in names if not conf["IGNORE_RE"].search(name)]
+
+
+def pm2(conf, v):
+    pid = read(os.path.expanduser("~/.pm2/pm2.pid")).strip()
+    if not pid:
+        return []  # pm2 isn't used here
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return ["pm2 daemon not running"]  # calling pm2 now would start an empty one
+    except PermissionError:
+        pass  # the pid exists
+    out = run("pm2", "jlist")
+    start = re.search(r"\[\s*[{\]]", out)  # skip "[PM2] ..." notices printed around the JSON
+    if not start:
+        raise ValueError("pm2 jlist printed no JSON")
+    data, _ = json.JSONDecoder().raw_decode(out, start.start())
+    apps = [{"name": p["name"], "status": p["pm2_env"]["status"], "cpu": p.get("monit", {}).get("cpu", 0),
+             "mem": p.get("monit", {}).get("memory", 0) // 1048576, "restarts": p["pm2_env"].get("restart_time", 0)}
+            for p in data]
+    v["pm2"] = apps[:50]  # shown on the server's page in the Mac app
+    return [f"pm2 {a['name']} down" for a in apps if a["status"] != "online"]  # one name, whatever the status
+
+
+def docker(conf, v):
+    # as root a failing docker is loud; without root (a no-install check over SSH) it is only out of sight
+    out = run("docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}\t{{.Status}}", check=os.geteuid() == 0)
+    boxes = [dict(zip(("name", "state", "status"), (line.split("\t") + ["", ""])[:3])) for line in out.splitlines()]
+    v["docker"] = boxes[:50]  # shown on the server's page in the Mac app
+    found = []
+    for box in boxes:
+        if box["state"] == "restarting" or "(unhealthy)" in box["status"]:
+            found.append(f"docker {box['name']} unhealthy")  # one name, so flapping can't spam alerts
+    return found
+
+
+def site_label(spec):
+    """host/path only: no user:password, query or fragment in alerts or the world-readable state."""
+    parts = urllib.parse.urlsplit(spec if "://" in spec else "https://" + spec)
+    return (parts.hostname or "?") + parts.path
+
+
+def site(spec):
+    url = spec if "://" in spec else "https://" + spec
+    label = site_label(spec)
+    if urllib.parse.urlsplit(url).scheme not in ("https", "http"):
+        return f"site {label} invalid url"
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "flatline"})
+        with urllib.request.urlopen(request, timeout=10):  # http(s) checked above  # nosec B310
+            return None
+    except urllib.error.HTTPError as e:  # 4xx counts as up: login walls answer 401/403
+        return f"site {label} down" if e.code >= 500 else None
+    except urllib.error.URLError as e:
+        return f"site {label} " + ("certificate error" if isinstance(e.reason, ssl.SSLError) else "down")
+    except Exception:  # timeouts, broken HTTP, anything else
+        return f"site {label} down"
+
+
+def peer(spec):
+    name, _, addr = spec.rpartition("=")
+    if addr.startswith("["):
+        host, _, port = addr[1:].partition("]")
+        port = port.lstrip(":")
+    else:
+        host, _, port = addr.partition(":")
+    try:
+        socket.create_connection((host, int(port or 22)), timeout=5).close()
+        return None
+    except (OSError, ValueError, OverflowError):
+        return f"peer {name or host} unreachable"
+
+
+def probe(check, spec):
+    """Runs a site or peer check twice before calling it a problem, so blips stay quiet."""
+    problem = check(spec)
+    if problem:
+        time.sleep(3)
+        problem = check(spec)
+    return problem
+
+
+def remote(conf, v):
+    checks = [(site, s.strip()) for s in conf["SITES"].split(",") if s.strip()]
+    checks += [(peer, p.strip()) for p in conf["PEERS"].split(",") if p.strip()]
+    if not checks:
+        return []
+    pool = ThreadPoolExecutor(8)
+    futures = {pool.submit(probe, *c): c for c in checks}
+    done, late = wait(futures, timeout=REMOTE_DEADLINE)
+    pool.shutdown(wait=False)  # ponytail: a host that trickles bytes keeps its thread until it gives up
+    found = [f.result() for f in done if f.result()]
+    found += [f"site {site_label(spec)} down" if check is site else f"peer {spec.rpartition('=')[0] or spec} unreachable"
+              for check, spec in (futures[f] for f in late)]
+    return found
+
+
+def problems(conf, v):
+    found = []
+    for check in (thresholds, units, pm2, docker, remote):
+        try:
+            found += check(conf, v)
+        except Exception as e:  # a broken check must be loud, never silently blind
+            log(f"{check.__name__} check crashed: {e!r}")
+            found.append(f"{check.__name__} check failed")
+    return found
+
+
+def tg(token, method, **params):
+    """Calls the Telegram Bot API. Returns the decoded reply, or {} when Telegram can't be reached."""
+    try:
+        request = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}",
+                                         urllib.parse.urlencode(params).encode())
+        with urllib.request.urlopen(request, timeout=15) as r:  # fixed https URL  # nosec B310
+            reply = json.loads(r.read(1_000_000))
+    except urllib.error.HTTPError as e:  # Telegram explains refusals in the body
+        try:
+            reply = json.loads(e.read(1_000_000))
+        except ValueError:
+            return {}
+    except (OSError, ValueError):
+        return {}
+    return reply if isinstance(reply, dict) else {}
+
+
+def send(token, chat, text):
+    return bool(tg(token, "sendMessage", chat_id=chat, text=text[:4000]).get("ok"))
+
+
+def heartbeat(url):
+    def ping():
+        try:
+            urllib.request.urlopen(url, timeout=10).close()  # http(s) checked above  # nosec B310
+        except Exception:
+            pass
+    if url.startswith(("https://", "http://")):
+        threading.Thread(target=ping, daemon=True).start()  # never holds up a check
+
+
+def uptime(s):
+    return f"{s // 86400}d {s % 86400 // 3600}h" if s >= 86400 else f"{s // 3600}h {s % 3600 // 60}m"
+
+
+def bullets(items):
+    return "\n".join(f"• {p}" for p in sorted(items))
+
+
+def summary(name, v, probs):
+    head = f"{'🔴' if probs else '🟢'} {name} · up {uptime(v['uptime'])}\n"
+    body = f"cpu {v['cpu']:.0f}% · ram {v['ram']:.0f}% · disk {v['disk']:.0f}% · load {v['load'][0]}"
+    return head + body + ("\n" + bullets(probs) if probs else "")
+
+
+def tick(conf, state):
+    """One check. Alerts on problems seen twice in a row and announces recoveries."""
+    v = vitals()
+    now = set(problems(conf, v))
+    alerted = set(state.get("alerted", []))
+    new = (now & set(state.get("problems", []))) - alerted
+    fixed = alerted - now
+    token, chat, name = conf["TELEGRAM_TOKEN"], conf["TELEGRAM_CHAT_ID"], conf["NAME"]
+    if token and chat:
+        # a failed send leaves the set as it was, so the next check tries again
+        if new and send(token, chat, f"🔴 {name}\n{bullets(new)}"):
+            alerted |= new
+        if fixed and send(token, chat, f"✅ {name} recovered\n{bullets(fixed)}"):
+            alerted -= fixed
+    heartbeat(conf["HEARTBEAT_URL"])
+    return {"time": int(time.time()), "name": name, "interval": conf["INTERVAL"], "version": VERSION,
+            "problems": sorted(now), "alerted": sorted(alerted),
+            "details": {k: v[k] for k in ("pm2", "docker") if k in v}}
+
+
+def read_state():
+    try:
+        return json.loads(read(STATE) or "{}")
+    except ValueError:
+        return {}
+
+
+def write_state(state):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(state, f)
+    os.chmod(STATE + ".tmp", 0o644)  # any SSH user can run `flatline status`; no secrets in here
+    os.replace(STATE + ".tmp", STATE)
+
+
+def watch():
+    conf, state = load_conf(), read_state()
+    log(f"flatline {VERSION} watching {conf['NAME']} every {conf['INTERVAL']:g}s"
+        + ("" if conf["TELEGRAM_TOKEN"] else " (Telegram not set up yet: sudo flatline setup)"))
+    while True:
+        started = time.monotonic()
+        try:
+            state = tick(conf, state)
+            write_state(state)
+        except Exception as e:  # never let one bad check stop the watch
+            log(f"check failed: {e!r}")
+        time.sleep(max(1.0, conf["INTERVAL"] - (time.monotonic() - started)))
+
+
+def status(as_json, live=False):
+    if live:  # nothing installed: check right now, write nothing
+        conf, state = load_conf(), {}
+        v = vitals()
+        probs, name = problems(conf, v), conf["NAME"]
+        details = {k: v.pop(k) for k in ("pm2", "docker") if k in v}
+    else:
+        state = read_state()
+        probs = list(state.get("problems", []))
+        if time.time() - state.get("time", 0) > 3 * state.get("interval", 60):
+            probs.append("flatline watch is not running")
+        name, v, details = state.get("name") or socket.gethostname(), vitals(), state.get("details", {})
+    if as_json:
+        system = {"os": parse(read("/etc/os-release")).get("PRETTY_NAME", "Linux"), "kernel": os.uname().release}
+        print(json.dumps(dict(v, name=name, problems=probs, agent=not live, **system, **details)))
+    else:
+        print(summary(name, v, probs))
+
+
+def require_root():
+    if os.geteuid() != 0:
+        die(77, "flatline: run as root: sudo flatline " + sys.argv[1])
+
+
+def finish(token, chat, name):
+    run("systemctl", "try-restart", "flatline", check=False)
+    if token and not send(token, chat, f"💓 Flatline is now watching {name}"):
+        die(69, f"flatline: saved {CONF}, but this server can't reach Telegram")
+    print(f"Saved {CONF}")
+
+
+def setup():
+    require_root()
+    try:
+        tty = open("/dev/tty")  # works under `curl ... | sudo bash`
+    except OSError:
+        die(65, "flatline: no terminal here. Run `sudo flatline setup` over SSH, or connect Telegram from the Mac app")
+    with tty:
+        def ask(question):
+            print(question, end=" ", flush=True)
+            return tty.readline(200).strip()
+
+        name = re.sub(r"[^\w.-]", "", ask(f"Server name [{socket.gethostname()}]:"))[:64] or socket.gethostname()
+        values = {"NAME": name}
+        token = getpass.getpass("Telegram bot token from @BotFather (Enter to skip): ").strip()
+        if token:
+            if not TOKEN_RE.fullmatch(token):
+                die(65, "flatline: that isn't a bot token (looks like 123456:ABC...). Run: sudo flatline setup")
+            ask("Now send any message to your bot in Telegram, then press Enter.")
+            updates = tg(token, "getUpdates").get("result", [])
+            chats = [(u.get("message") or {}).get("chat") for u in updates if isinstance(u, dict)]
+            chats = [c for c in chats if isinstance(c, dict) and isinstance(c.get("id"), int)]
+            if not chats:
+                die(65, "flatline: the bot got no message. Message it, then run: sudo flatline setup")
+            chat = chats[-1]
+            who = chat.get("title") or " ".join(filter(None, (chat.get("first_name"), chat.get("last_name"))))
+            who += f" (@{chat['username']})" if chat.get("username") else ""
+            if ask(f"Send alerts to {who or chat['id']}? [y/N]").lower() not in ("y", "yes"):
+                die(65, "flatline: nothing saved. Message the bot from your own account, then run: sudo flatline setup")
+            values.update(TELEGRAM_TOKEN=token, TELEGRAM_CHAT_ID=chat["id"])
+    save_conf(values)
+    finish(values.get("TELEGRAM_TOKEN"), values.get("TELEGRAM_CHAT_ID"), name)
+
+
+def telegram():
+    require_root()
+    token, chat = sys.stdin.readline(200).strip(), sys.stdin.readline(50).strip()
+    if not TOKEN_RE.fullmatch(token) or not CHAT_RE.fullmatch(chat):
+        die(65, "flatline: expected a bot token and a chat id on stdin")
+    save_conf({"TELEGRAM_TOKEN": token, "TELEGRAM_CHAT_ID": chat})
+    finish(token, chat, load_conf()["NAME"])
+
+
+# Read-only sharing. Access is a line in the `flatline` user's authorized_keys that can only ever
+# run `flatline status`: `restrict` turns off shells, ttys and forwarding, `command=` pins the command.
+
+
+def keys_file():
+    return os.path.join(SHARE_HOME, ".ssh", "authorized_keys")
+
+
+def edit_keys(change):
+    """Rewrites authorized_keys under a lock, atomically, keeping it private to the flatline user."""
+    path = keys_file()
+    with open(os.path.join(SHARE_HOME, ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        lines = change([l for l in read(path).splitlines() if l.strip()])
+        fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write("".join(l + "\n" for l in lines))
+        os.replace(path + ".tmp", path)
+
+
+def share():
+    require_root()
+    key = " ".join(sys.stdin.readline(300).split()[:2])  # "ssh-ed25519 AAAA…", any comment dropped
+    if not KEY_RE.fullmatch(key):
+        die(65, "flatline: expected an ed25519 public key on stdin")
+    try:
+        pwd.getpwnam(SHARE_USER)
+    except KeyError:  # a locked system account whose only purpose is to answer `flatline status`
+        run("useradd", "--system", "--home-dir", SHARE_HOME, "--create-home", "--shell", "/bin/sh", SHARE_USER)
+        run("usermod", "-p", "*", SHARE_USER)  # no password at all, yet not "locked", so sshd accepts its keys
+    user = pwd.getpwnam(SHARE_USER)
+    os.makedirs(os.path.join(SHARE_HOME, ".ssh"), mode=0o700, exist_ok=True)
+    for path in (SHARE_HOME, os.path.join(SHARE_HOME, ".ssh")):
+        os.chown(path, user.pw_uid, user.pw_gid)
+        os.chmod(path, 0o700)
+    invite = secrets.token_hex(8)
+    expiry = time.strftime("%Y%m%d%H%M", time.gmtime(time.time() + 86400))
+    edit_keys(lambda lines: lines + [f'restrict,command="/usr/local/bin/flatline redeem {invite}",expiry-time="{expiry}Z" '
+                                     f"{key} flatline-invite-{invite}"])
+    for path in (keys_file(), os.path.join(SHARE_HOME, ".lock")):
+        os.chown(path, user.pw_uid, user.pw_gid)
+    hostkeys = [read(p).split()[:2] for p in sorted(glob.glob("/etc/ssh/ssh_host_*_key.pub"))]
+    print(json.dumps({"user": SHARE_USER, "invite": invite, "hostkeys": [" ".join(k) for k in hostkeys if len(k) == 2]}))
+
+
+def redeem(invite):
+    """Runs as the flatline user with the one-time invite key. Trades it for the guest's own key, once."""
+    key, name = " ".join(sys.stdin.readline(300).split()[:2]), sys.stdin.readline(100).strip()
+    if not re.fullmatch(r"[0-9a-f]{16}", invite) or not KEY_RE.fullmatch(key) or not NAME_RE.fullmatch(name):
+        die(65, "flatline: bad invite")
+    marker = f" flatline-invite-{invite}"
+
+    def trade(lines):
+        if not any(l.endswith(marker) for l in lines):
+            die(65, "flatline: this invite was already used")
+        kept = [l for l in lines if not l.endswith(marker)]
+        return kept + [f'restrict,command="/usr/local/bin/flatline status --json" {key} flatline-guest-{name}']
+    edit_keys(trade)
+    print("ok")
+
+
+def guests():
+    return [l.rsplit(" flatline-guest-", 1)[1] for l in read(keys_file()).splitlines() if " flatline-guest-" in l]
+
+
+def access(as_json):
+    require_root()
+    names = guests()
+    print(json.dumps(names) if as_json else "\n".join(names) or "Nobody else has access.")
+
+
+def revoke(name):
+    require_root()
+    if not NAME_RE.fullmatch(name) or name not in guests():
+        die(65, f"flatline: no guest called {name}")
+    edit_keys(lambda lines: [l for l in lines if not l.endswith(f" flatline-guest-{name}")])
+    print(f"{name} can no longer see this server.")
+
+
+def uninstall():
+    require_root()
+    run("systemctl", "disable", "--now", "flatline", check=False)
+    for path in ("/etc/systemd/system/flatline.service", CONF, CONF + ".tmp", "/usr/local/bin/flatline"):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    shutil.rmtree(os.path.dirname(STATE), ignore_errors=True)
+    try:
+        pwd.getpwnam(SHARE_USER)
+        run("userdel", "--remove", SHARE_USER, check=False)  # takes every guest key with it
+    except KeyError:
+        pass
+    shutil.rmtree(SHARE_HOME, ignore_errors=True)
+    run("systemctl", "daemon-reload", check=False)
+    print("Flatline is gone from this server. Only past journal lines remain, and they rotate away.")
+
+
+if __name__ == "__main__":
+    command = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if command == "status":
+        status("--json" in sys.argv, live="--live" in sys.argv)
+    elif command == "watch":
+        watch()
+    elif command == "setup":
+        setup()
+    elif command == "telegram":
+        telegram()
+    elif command == "share":
+        share()
+    elif command == "redeem" and len(sys.argv) == 3:
+        redeem(sys.argv[2])
+    elif command == "access":
+        access("--json" in sys.argv)
+    elif command == "revoke" and len(sys.argv) == 3:
+        revoke(sys.argv[2])
+    elif command == "uninstall":
+        uninstall()
+    elif command in ("-v", "--version"):
+        print(VERSION)
+    else:
+        sys.exit(__doc__)

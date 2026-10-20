@@ -1,0 +1,19 @@
+# Flatline doesn't take outside pull requests: close them with a friendly note.
+# Safe on pull_request_target because it never checks out or runs the pull request's code.
+name: close outside pull requests
+on:
+  pull_request_target:
+    types: [opened, reopened]
+permissions:
+  pull-requests: write
+jobs:
+  close:
+    if: github.event.pull_request.user.login != github.repository_owner
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr close "$PR" --repo "$REPO" --comment "Thanks for taking the time! Flatline doesn't accept outside pull requests, so this one is closed automatically. Bug reports and ideas are welcome as issues."

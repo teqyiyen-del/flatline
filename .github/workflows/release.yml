@@ -1,0 +1,38 @@
+# Push a tag like v0.2.0 to publish a release: tested, built on GitHub, checksummed and attested.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions: {}
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write  # create the release
+      id-token: write  # sign the build provenance
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Tag matches the version in the agent
+        run: test "v$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' agent/flatline)" = "$GITHUB_REF_NAME"
+      - name: Test the agent
+        run: python3 agent/test_flatline.py
+      - name: Build the app
+        run: ./app/build.sh
+      - name: Build the disk image
+        run: |
+          python3 -m venv "$RUNNER_TEMP/tools"
+          "$RUNNER_TEMP/tools/bin/pip" install --quiet dmgbuild==1.6.5
+          DMGBUILD="$RUNNER_TEMP/tools/bin/dmgbuild" ./app/make-dmg.sh
+      - name: Collect the files and their checksums
+        run: |
+          cp agent/flatline install.sh dist/
+          cd dist && shasum -a 256 Flatline.dmg flatline install.sh > SHA256SUMS
+      - name: Attest where the files were built
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "Flatline $GITHUB_REF_NAME" --generate-notes
