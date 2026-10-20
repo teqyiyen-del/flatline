@@ -1,6 +1,7 @@
 // Flatline: a menu bar pulse for servers running the Flatline agent.
 // Every 30 s it runs `flatline status --json` on each server over SSH, with the keys you already use.
 // Servers and the Telegram bot are set up in the panel; the bot token is kept in the macOS Keychain.
+import CryptoKit
 import Security
 import ServiceManagement
 import SwiftUI
@@ -8,6 +9,19 @@ import SwiftUI
 @main
 struct FlatlineApp: App {
     @StateObject private var monitor = Monitor()
+
+    init() {  // hidden, for tests: `Flatline --update-test` updates this copy like the Update button, minus the relaunch
+        guard CommandLine.arguments.dropFirst().first == "--update-test" else { return }
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            if let new = await Monitor.newerRelease() {
+                print(await Monitor.update(to: new).map { "✕ \($0)" } ?? "✓ updated to \(new)")
+            } else { print("no newer release") }
+            done.signal()
+        }
+        done.wait()
+        exit(0)
+    }
 
     var body: some Scene {
         MenuBarExtra {
@@ -42,6 +56,7 @@ struct Vitals: Decodable {
     var updates: Int?  // security updates pending
     var reboot: Bool?
     var agent: Bool?  // false: read once over SSH with nothing installed
+    var version: String?  // the agent's; 0.2.0 and older don't send it
 
     struct Pm2App: Decodable {
         let name, status: String
@@ -73,6 +88,18 @@ struct Server: Identifiable {
     var history: [Double] = []  // recent CPU readings, drawn as the pulse
     var healthy: Bool { error == nil && vitals?.problems.isEmpty == true }
     var notes: [String] { vitals?.problems ?? (error.map { [$0] } ?? []) }
+    /// Your own server, running an agent older than this app.
+    var outdated: Bool {
+        guard !guest, let v = vitals, v.agent == true, let mine = semver(Monitor.version) else { return false }
+        guard let version = v.version else { return true }
+        return semver(version)?.lexicographicallyPrecedes(mine) ?? false
+    }
+}
+
+/// "1.2.3" or "v1.2.3" as [1, 2, 3]; nil for anything else.
+func semver(_ text: String) -> [Int]? {
+    guard text.range(of: #"^v?[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}\z"#, options: .regularExpression) != nil else { return nil }
+    return text.trimmingPrefix("v").split(separator: ".").compactMap { Int($0) }
 }
 
 /// A server someone shared with you: read-only, through your own restricted key.
@@ -135,6 +162,16 @@ final class Monitor: ObservableObject {
     @Published var updated: Date?
     @Published var telegram = Keychain.load()
     @Published var guests: [Guest] = []
+    @Published var latest: String?  // a newer Flatline release, if GitHub has one
+    // runs that outlive the panel's pages, so reopening a page shows them and can't start a second one
+    @Published var updating = false
+    @Published var updateNote = ""  // why the app update didn't go through
+    @Published var agentBusy: Set<String> = []
+    @Published var agentNotes: [String: String] = [:]
+    @Published var wiping = false
+    @Published var wipeNote = ""  // uninstall progress, or what failed
+    nonisolated static let repo = "teqyiyen-del/flatline"
+    nonisolated static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
     nonisolated static let dir = URL.homeDirectory.appending(path: ".config/flatline")
     nonisolated static let ownKey = dir.appending(path: "id_ed25519")  // yours, for servers shared with you
     nonisolated static let knownHosts = dir.appending(path: "known_hosts")  // their host keys, pinned by the invite
@@ -148,6 +185,10 @@ final class Monitor: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespaces) }.filter(Monitor.valid)
         guests = (try? JSONDecoder().decode([Guest].self, from: Data(contentsOf: guestFile))) ?? []
         Task { while true { await refresh(); try? await Task.sleep(for: .seconds(30)) } }
+        Task {  // a minute in, so "Open at login" doesn't ask before the network is up, then daily
+            try? await Task.sleep(for: .seconds(60))
+            while true { if let new = await Monitor.newerRelease() { latest = new }; try? await Task.sleep(for: .seconds(86400)) }
+        }
     }
 
     /// An SSH destination such as root@203.0.113.10 or an alias from ~/.ssh/config. Never an ssh option.
@@ -172,6 +213,84 @@ final class Monitor: ObservableObject {
         let (code, _) = await Monitor.ssh(Monitor.own(host), Monitor.root("flatline uninstall"))
         guard code == 0 || code == 127 else { return code == 255 ? "can't reach it over ssh" : "needs root or passwordless sudo" }
         remove(host)
+        return nil
+    }
+
+    /// The remote command that updates the agent to `version` (digits only) through that release's own verified installer.
+    nonisolated static func agentInstall(_ version: String) -> String? {
+        guard version.range(of: #"^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}\z"#, options: .regularExpression) != nil else { return nil }
+        return "curl -fsSL --proto '=https' --tlsv1.2 https://github.com/\(repo)/releases/download/v\(version)/install.sh | "
+            + root("env FLATLINE_VERSION=v\(version) bash 2>&1")  // sudo's and the installer's complaints come back, curl's don't
+    }
+
+    /// Brings the agent on your own server up to this app's version. The installer keeps /etc/flatline.conf and restarts it.
+    func updateAgent(_ host: String) async {
+        guard !agentBusy.contains(host) else { return }
+        agentBusy.insert(host)
+        defer { agentBusy.remove(host) }
+        agentNotes[host] = nil
+        guard let command = Monitor.agentInstall(Monitor.version) else { agentNotes[host] = "✕ this build has no release version"; return }
+        let (code, out) = await Monitor.ssh(Monitor.own(host), command, timeout: 120)
+        let now = await Monitor.check(host, Monitor.own(host), guest: false).vitals?.version  // a refresh under way may hold the old one
+        await refresh()
+        guard now != Monitor.version else { return }
+        let said = String(decoding: out, as: UTF8.self).split(separator: "\n").last.map(String.init) ?? ""
+        let v = Monitor.version
+        agentNotes[host] = "✕ " + (code == 255 ? "can't reach it over ssh"
+            : said.contains("sudo") ? "it needs root or passwordless sudo (\(said)). Run this on the server instead:\n"
+                + "curl -fsSL https://github.com/\(Monitor.repo)/releases/download/v\(v)/install.sh | sudo FLATLINE_VERSION=v\(v) bash"
+            : said.isEmpty ? "couldn't download the v\(v) installer. Is that release published?"  // curl failed, bash ran nothing
+            : said)  // the installer's own "flatline: ..." refusal
+    }
+
+    /// Replaces this app with release `version` and reopens it. One run at a time.
+    func updateApp(to version: String) async {
+        guard !updating else { return }
+        updating = true
+        updateNote = ""
+        if let error = await Monitor.update(to: version) { updateNote = "✕ " + error; updating = false } else { Monitor.relaunch() }
+    }
+
+    /// Your servers first when asked (a failure doesn't stop the rest), then everything Flatline keeps on this Mac.
+    func uninstallFlatline(fromServers: Bool) async {
+        guard !wiping else { return }
+        wiping = true
+        defer { wiping = false }
+        wipeNote = ""
+        if fromServers {  // own servers with an agent; servers shared with you just go with ~/.config/flatline
+            var failed: [String] = []
+            for host in hosts where servers.first(where: { $0.id == host })?.vitals?.agent != false {
+                wipeNote = "Removing Flatline from \(host)…"
+                if let error = await uninstall(host) { failed.append("✕ \(host): \(error)") }
+            }
+            if !failed.isEmpty {
+                wipeNote = (failed + ["Remove it there with sudo flatline uninstall. Uninstall again to finish on this Mac."]).joined(separator: "\n")
+                return
+            }
+        }
+        if let error = Monitor.wipe() { wipeNote = "✕ " + error } else { NSApp.terminate(nil) }
+    }
+
+    /// Takes Flatline off this Mac: the open-at-login item, the app itself (to the Trash), the Keychain item and
+    /// ~/.config/flatline (servers, your key for servers shared with you, their pinned host keys). Nothing else, never ~/.ssh.
+    /// The app goes first, since it's the step most likely to fail; running it again picks up where a failure stopped.
+    nonisolated static func wipe(dir: URL = dir, keychain: [String: Any] = Keychain.item, app: URL = Bundle.main.bundleURL,
+                                 login: SMAppService = .mainApp) -> String? {
+        let fm = FileManager.default, atLogin = login.status == .enabled
+        try? login.unregister()  // while the app is still where it was registered; throws when it never was
+        if fm.fileExists(atPath: app.path) {
+            do { try fm.trashItem(at: app, resultingItemURL: nil) } catch {
+                if atLogin { try? login.register() }
+                return "couldn't move the app to the Trash, nothing changed. Is it running from the disk image? Move it to Applications first"
+            }
+        }
+        let status = SecItemDelete(keychain as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            return "couldn't remove the Telegram token from the Keychain. Allow it and uninstall again, or delete \"Flatline\" in Keychain Access"
+        }
+        do { try fm.removeItem(at: dir) } catch let error as NSError where error.code != NSFileNoSuchFileError {
+            return "couldn't remove \(dir.path): \(error.localizedDescription)"
+        } catch {}  // already gone
         return nil
     }
 
@@ -267,6 +386,83 @@ final class Monitor: ObservableObject {
                 done.resume(returning: (process.terminationStatus, data))
             }
         }
+    }
+
+    // MARK: Updates
+
+    /// The newest release if it's newer than this app. Quiet: offline, rate limited or odd JSON all just mean no.
+    nonisolated static func newerRelease() async -> String? {
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!, timeoutInterval: 10)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("Flatline/\(version)", forHTTPHeaderField: "User-Agent")
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let tag = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["tag_name"] as? String,
+              let new = semver(tag), let mine = semver(version), mine.lexicographicallyPrecedes(new) else { return nil }
+        return new.map(String.init).joined(separator: ".")
+    }
+
+    /// Replaces the app wherever it lives with release `version`. Trust is the same as downloading it by hand:
+    /// HTTPS to GitHub, and the DMG must match the release's SHA256SUMS.
+    nonisolated static func update(to version: String, over app: URL = Bundle.main.bundleURL) async -> String? {
+        let release = "https://github.com/\(repo)/releases/download/v\(version)/"
+        guard semver(version) != nil, let sums = await fetch(release + "SHA256SUMS", cap: 65536),
+              let dmg = await fetch(release + "Flatline.dmg", cap: 100_000_000) else { return "couldn't download Flatline \(version)" }
+        return await install(dmg, version, sums: sums, over: app)
+    }
+
+    /// Downloads a file, refusing anything bigger than `cap` bytes.
+    nonisolated static func fetch(_ url: String, cap: Int) async -> Data? {
+        guard let url = URL(string: url), let (bytes, response) = try? await URLSession.shared.bytes(for: URLRequest(url: url, timeoutInterval: 30)),
+              (response as? HTTPURLResponse)?.statusCode == 200, response.expectedContentLength <= cap else { return nil }
+        var data = Data()
+        do { for try await byte in bytes { data.append(byte); if data.count > cap { return nil } } } catch { return nil }
+        return data
+    }
+
+    /// Checks the DMG against the release's checksum, takes Flatline.app out of it, checks that, then swaps it in.
+    nonisolated static func install(_ dmg: Data, _ version: String, sums: Data, over app: URL) async -> String? {
+        let digest = SHA256.hash(data: dmg).map { String(format: "%02x", $0) }.joined()
+        guard String(decoding: sums, as: UTF8.self).split(separator: "\n").contains(where: { $0 == "\(digest)  Flatline.dmg" }) else {
+            return "the download doesn't match the release's checksum, nothing changed"
+        }
+        let fm = FileManager.default
+        let temp = fm.temporaryDirectory.appending(path: "flatline-\(UUID().uuidString)")
+        try? fm.createDirectory(at: temp, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? fm.removeItem(at: temp) }
+        let image = temp.appending(path: "Flatline.dmg"), mount = temp.appending(path: "mnt"), new = temp.appending(path: "Flatline.app")
+        guard (try? dmg.write(to: image)) != nil else { return "couldn't save the download" }
+        var copied: Int32 = -1
+        if await run("/usr/bin/hdiutil", ["attach", "-nobrowse", "-readonly", "-noautoopen", "-mountpoint", mount.path, image.path], timeout: 60).0 == 0 {
+            copied = await run("/usr/bin/ditto", [mount.appending(path: "Flatline.app").path, new.path], timeout: 60).0
+        }
+        _ = await run("/usr/bin/hdiutil", ["detach", "-force", mount.path])
+        guard copied == 0, let bundle = Bundle(url: new), let id = bundle.bundleIdentifier, id == Bundle(url: app)?.bundleIdentifier,
+              bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String == version,
+              await run("/usr/bin/codesign", ["--verify", "--deep", "--strict", new.path], timeout: 60).0 == 0 else {
+            return "the download isn't a sound Flatline \(version), nothing changed"
+        }
+        let manual = "couldn't replace the app where it is. Drag the new version from the [DMG](https://github.com/\(repo)/releases/tag/v\(version)) yourself"
+        let staged = app.deletingLastPathComponent().appending(path: ".Flatline-\(UUID().uuidString).app")  // same volume: the swap is a rename
+        defer { try? fm.removeItem(at: staged) }
+        guard await run("/usr/bin/ditto", [new.path, staged.path], timeout: 60).0 == 0 else { return manual + ", nothing changed" }
+        _ = await run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", staged.path])
+        var old: NSURL?
+        do { try fm.trashItem(at: app, resultingItemURL: &old) } catch { return manual + ", nothing changed" }
+        do { try fm.moveItem(at: staged, to: app) } catch {
+            if let old, (try? fm.moveItem(at: old as URL, to: app)) != nil { return manual }  // the old one is back
+            return manual + ". Your previous Flatline is in the Trash"
+        }
+        return nil
+    }
+
+    /// Quits, and opens the app again from the same path once this process is gone.
+    static func relaunch() {
+        let shell = Process()
+        shell.executableURL = URL(fileURLWithPath: "/bin/sh")
+        shell.arguments = ["-c", #"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open "$2""#, "relaunch",
+                           String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundleURL.path]
+        try? shell.run()
+        NSApp.terminate(nil)
     }
 
     // MARK: Sharing
@@ -542,6 +738,9 @@ struct Hero: View {
                 if case .detail = page { Icon("chevron.left", action: back) }
                 Spacer()
                 Icon(page == .settings ? "xmark" : "gearshape", action: settings)
+                    .overlay(alignment: .topTrailing) {  // a new Flatline is out
+                        if monitor.latest != nil && page != .settings { Circle().fill(Color.ok).frame(width: 7, height: 7) }
+                    }
             }
             .padding(10)
         }
@@ -820,6 +1019,7 @@ struct DetailCard: View {
     var content: some View {
         VStack(alignment: .leading, spacing: 16) {
             if let v = server.vitals {
+                if server.outdated { AgentUpdate(host: server.id, version: v.version) }
                 HStack(spacing: 8) {
                     Tile(label: "CPU", value: v.cpu, caption: v.cores.map { "\($0) cores" } ?? "")
                     Tile(label: "RAM", value: v.ram, caption: size(v.memUsed.map { Double($0) / 1024 }, v.memTotal.map { Double($0) / 1024 }))
@@ -951,6 +1151,41 @@ struct Sharing: View {
     }
 }
 
+/// An agent older than this app, brought up to date with one click and one confirm.
+struct AgentUpdate: View {
+    @EnvironmentObject var monitor: Monitor
+    let host: String
+    let version: String?
+    @State private var asking = false
+
+    var body: some View {
+        let busy = monitor.agentBusy.contains(host), note = monitor.agentNotes[host] ?? ""
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Agent \(version ?? "older") → \(Monitor.version)").foregroundStyle(Color.ink)
+                Spacer()
+                if !asking { Pill(busy ? "Updating…" : "Update agent") { withAnimation(.snappy(duration: 0.2)) { asking = true } }.disabled(busy) }
+            }
+            if asking {
+                Text("Runs the verified \(Monitor.version) installer on this server. Your settings stay.")
+                    .font(mono(11)).foregroundStyle(Color.muted).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Pill("Update now") {
+                        asking = false
+                        Task { await monitor.updateAgent(host) }
+                    }
+                    Pill("Cancel", dark: false, fill: .white) { asking = false }
+                }
+            }
+            if !note.isEmpty {
+                Text(note).font(mono(10.5)).foregroundStyle(Color.bad).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(Color.field, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+}
+
 struct Tile: View {
     let label: String
     let value: Double
@@ -1058,8 +1293,20 @@ struct SettingsCard: View {
     @State private var report = ""
     @State private var busy = false
     @State private var atLogin = SMAppService.mainApp.status == .enabled
+    @State private var leaving = false  // the uninstall confirm is open
+    @State private var everywhere = false  // also take the agents off your servers
 
     var body: some View {
+        ScrollViewReader { scroll in  // long settings scroll inside the panel, so small screens still reach the bottom
+            ScrollView { content }.frame(maxHeight: 520).fixedSize(horizontal: false, vertical: true).card()
+                .onChange(of: leaving) { _, open in
+                    if open { DispatchQueue.main.async { withAnimation { scroll.scrollTo("uninstall", anchor: .bottom) } } }
+                }
+        }
+        .onAppear { leaving = !monitor.wipeNote.isEmpty }  // an uninstall still running, or one that stopped
+    }
+
+    var content: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionTitle("Servers")
             ForEach(monitor.hosts, id: \.self) { h in
@@ -1123,18 +1370,50 @@ struct SettingsCard: View {
                     do { try on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
                     catch { atLogin = SMAppService.mainApp.status == .enabled }
                 }
-            HStack {
-                Text("Flatline \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")")
-                    .font(mono(11)).foregroundStyle(Color.muted)
-                Spacer()
+            if let latest = monitor.latest {
+                HStack {
+                    Text("Flatline \(latest) is out").foregroundStyle(Color.ink)
+                    Spacer()
+                    Pill(monitor.updating ? "Updating…" : "Update") { Task { await monitor.updateApp(to: latest) } }.disabled(monitor.updating)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(Color.field, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                if !monitor.updateNote.isEmpty {
+                    Text(LocalizedStringKey(monitor.updateNote)).font(mono(11)).foregroundStyle(Color.bad).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack(spacing: 8) {
+                Text("Flatline \(Monitor.version)").font(mono(11)).foregroundStyle(Color.muted).lineLimit(1)
+                Spacer(minLength: 0)
+                Button("Uninstall Flatline…") { withAnimation(.snappy(duration: 0.2)) { leaving.toggle() } }
+                    .buttonStyle(Press()).font(mono(11)).foregroundStyle(Color.bad).fixedSize().disabled(monitor.wiping)
                 Pill("Quit", dark: false) { NSApp.terminate(nil) }
             }
             .padding(.top, 6)
+            if leaving {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("This removes the app, its settings and server list (~/.config/flatline, including its own SSH key for servers shared with you and their pinned host keys), the Telegram token in the Keychain and the open-at-login item. Nothing else.")
+                        .font(mono(11)).foregroundStyle(Color.muted).fixedSize(horizontal: false, vertical: true)
+                    Switch("Also remove Flatline from my servers", on: $everywhere).disabled(monitor.wiping)
+                    if !monitor.wipeNote.isEmpty {
+                        Text(monitor.wipeNote).font(mono(11)).foregroundStyle(Color.ink).fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 8) {
+                        Pill(monitor.wiping ? "Uninstalling…" : "Uninstall", fill: .bad) {
+                            Task { await monitor.uninstallFlatline(fromServers: everywhere); everywhere = false }  // next click only finishes this Mac
+                        }
+                        Pill("Cancel", dark: false, fill: .white) { leaving = false; monitor.wipeNote = "" }
+                    }
+                    .disabled(monitor.wiping)
+                }
+                .padding(12)
+                .background(Color.field, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .id("uninstall")
+            }
         }
         .font(mono(12))
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .card()
     }
 
     func add() {
@@ -1186,11 +1465,13 @@ struct Input: View {
 struct Pill: View {
     let title: String
     let dark: Bool
+    let fill: Color?
     let action: () -> Void
 
-    init(_ title: String, dark: Bool = true, action: @escaping () -> Void) {
+    init(_ title: String, dark: Bool = true, fill: Color? = nil, action: @escaping () -> Void) {
         self.title = title
         self.dark = dark
+        self.fill = fill
         self.action = action
     }
 
@@ -1198,7 +1479,7 @@ struct Pill: View {
         Button(action: action) {
             Text(title).font(mono(12, .medium)).foregroundStyle(dark ? Color.white : Color.ink)
                 .padding(.horizontal, 12).padding(.vertical, 7)
-                .background(dark ? Color.button : Color.field, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(fill ?? (dark ? Color.button : Color.field), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(Press())
     }

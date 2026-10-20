@@ -1,6 +1,6 @@
 # Flatline
 
-**Know before your server flatlines.**
+**Know before your server flatlines.** · [getflatline.vercel.app](https://getflatline.vercel.app)
 
 ![Flatline in the menu bar, watching ten servers](docs/flatline.png)
 
@@ -95,12 +95,12 @@ A problem has to show up on two checks in a row before you get an alert, and has
 ## Security
 
 - **No listener.** The agent opens no ports and accepts no connections. It only reads system state and makes outgoing requests to Telegram, the sites you list (with their robots.txt and sitemap for `SEO_SITES`) and your heartbeat URL. It never runs a shell and uses nothing outside the Python standard library.
-- **Read-only on purpose.** Flatline never restarts a service, clears a disk or changes anything on your server. A monitor that can write to your server is a different, riskier tool: if it's ever fooled or broken, it can do damage. Flatline tells you, and you decide.
+- **Read-only on purpose.** The agent never restarts a service, clears a disk or changes anything on your server. The app only changes a server when you click something on its page, like "Update agent" or "Remove from server too". A monitor that can write to your server is a different, riskier tool: if it's ever fooled or broken, it can do damage. Flatline tells you, and you decide.
 - **Sandboxed.** systemd runs it with no capabilities, a read-only file system apart from its own state folder, private `/tmp` and `/dev`, a system call filter and locked kernel settings. `systemd-analyze security flatline` rates it 2.0 (OK).
 - **Log reading, counted only.** Debian and Ubuntu keep web server logs as `www-data:adm`, mode 640, so on those systems the service joins the `adm` group to read `ACCESS_LOG`. That group can also read logs like syslog. Flatline only counts lines in the logs it reads (the journal of your `UNITS`, pm2 error logs and `ACCESS_LOG`) and never sends their text anywhere.
 - **Secrets stay put.** The bot token lives in `/etc/flatline.conf` (root only, mode 600) on servers and in the Keychain on your Mac. It never appears on a command line: the Mac app hands it over through SSH's standard input.
 - **Strict input.** Tokens and chat IDs must match exact formats, config values can't contain line breaks, unknown config keys are ignored and numbers are clamped to safe ranges.
-- **Two fixed commands.** Over SSH the app only ever runs `flatline status --json` and `flatline telegram`.
+- **A short, fixed list of commands.** Over SSH the app runs `flatline status --json` on every check (or, with nothing installed, the same check fed from the app). Only when you click them, and only on your own servers, it runs `flatline telegram`, `share`, `access`, `revoke` or `uninstall`, or "Update agent": the release's installer, pinned to your app's version, run as root, which checks the agent against the release's SHA256 checksum.
 - **Verifiable releases.** Every release is built on GitHub from a tagged commit. Check what you downloaded:
 
   ```sh
@@ -121,9 +121,17 @@ sudo flatline setup       # connect Telegram from the server
 journalctl -u flatline    # logs
 ```
 
+## Updating
+
+When a new release is out, a dot appears on the gear and Settings shows "Update". Flatline downloads the release, checks the disk image against the release's SHA256 checksum, replaces itself and reopens.
+
+When a server runs an older agent than your app, its page offers "Update agent". That runs the same verified installer, pinned to your app's version, and keeps your config. You can also re-run the install line on the server.
+
+Pushing code to this repository updates nobody. Only published releases do.
+
 ## Uninstall
 
-On a server, `sudo flatline uninstall`. On your Mac, quit Flatline from its settings and drag it from Applications to the Trash.
+On your Mac, gear → "Uninstall Flatline…" moves the app to the Trash and removes `~/.config/flatline`, the Telegram token in the Keychain and the open-at-login item. Switch on "Also remove Flatline from my servers" to take the agents off too. On a server, run `sudo flatline uninstall`.
 
 ## Building from source
 
