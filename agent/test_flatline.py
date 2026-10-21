@@ -70,7 +70,7 @@ assert [p["text"] for _, p in calls] == ["🔴 web-1\n• x", "✅ web-1 recover
 # notes ride along in alerts, recoveries stay plain, and details are kept for the Mac app
 def down_with_note(conf, v):
     v["services"] = [{"name": "nginx.service", "state": "active (running)", "restarts": 0}]
-    return [fl.note(v, "site piktram.com/en down", "HTTP 404"), "reboot required"]
+    return [fl.note(v, "site shop.example.com/en down", "HTTP 404"), "reboot required"]
 
 
 calls.clear()
@@ -79,8 +79,8 @@ for check in [down_with_note, down_with_note, lambda conf, v: [], lambda conf, v
     state = fl.tick(conf, state)
     if check is down_with_note:
         assert state["details"] == {"services": [{"name": "nginx.service", "state": "active (running)", "restarts": 0}]}
-assert [p["text"] for _, p in calls] == ["🔴 web-1\n• reboot required\n• site piktram.com/en down · HTTP 404",
-                                         "✅ web-1 recovered\n• reboot required\n• site piktram.com/en down"], calls
+assert [p["text"] for _, p in calls] == ["🔴 web-1\n• reboot required\n• site shop.example.com/en down · HTTP 404",
+                                         "✅ web-1 recovered\n• reboot required\n• site shop.example.com/en down"], calls
 
 # a failed send is retried on the next check instead of being lost
 fl.problems = lambda conf, v: ["x"]
